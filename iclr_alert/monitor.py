@@ -14,6 +14,11 @@ from . import core
 from .core import ProbeError, probe_openreview
 
 
+DEFAULT_WAITING_INTERVAL_SECONDS = 3600
+DEFAULT_WAITING_MESSAGE = "继续等待，不要着急，不要担心，你是最棒的！"
+DEFAULT_UPDATE_MESSAGE = "！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样"
+
+
 class Monitor:
     """Use one monitor process per database; accepted pushes are not delivery receipts."""
 
@@ -34,9 +39,19 @@ class Monitor:
                     created_at TEXT NOT NULL,
                     accepted_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS waiting_schedule (
+                    forum_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    pending_json TEXT
+                );
             """)
 
-    def check_once(self, paper: str, token: str, bark_key: str) -> dict:
+    def check_once(
+        self, paper: str, token: str, bark_key: str, *,
+        waiting_interval_seconds=DEFAULT_WAITING_INTERVAL_SECONDS,
+        waiting_message=DEFAULT_WAITING_MESSAGE,
+        update_message=DEFAULT_UPDATE_MESSAGE,
+    ) -> dict:
         try:
             forum_id = core.parse_forum_id(paper)
             probe = probe_openreview(paper, token)
@@ -44,7 +59,10 @@ class Monitor:
             return _failure(error)
         try:
             with closing(self._connect()) as db:
-                changed = self._store_observation(db, probe)
+                changed = self._store_observation(
+                    db, probe, waiting_interval_seconds=waiting_interval_seconds,
+                    waiting_message=waiting_message, update_message=update_message,
+                )
                 result = {
                     "status": "ok", "data_changed": changed,
                     "notification_status": "none", "probe": probe,
@@ -55,8 +73,18 @@ class Monitor:
                     "SELECT event_id, payload_json FROM outbox WHERE forum_id=? "
                     "AND accepted_at IS NULL ORDER BY created_at, rowid LIMIT 1", (forum_id,),
                 ).fetchone()
+                kind = "update"
+                if pending is None:
+                    waiting = db.execute(
+                        "SELECT pending_json FROM waiting_schedule WHERE forum_id=?", (forum_id,),
+                    ).fetchone()
+                    if waiting and waiting[0]:
+                        payload = json.loads(waiting[0])
+                        pending = payload["id"], waiting[0]
+                        kind = "waiting"
                 if pending:
                     event_id, payload_json = pending
+                    result["notification_kind"] = kind
                     try:
                         send_notification(bark_key, json.loads(payload_json))
                     except ProbeError as error:
@@ -65,10 +93,19 @@ class Monitor:
                         result["action"] = "retry_push"
                     else:
                         with db:
-                            db.execute("UPDATE outbox SET accepted_at=? WHERE event_id=?", (_now(), event_id))
+                            if kind == "update":
+                                db.execute("UPDATE outbox SET accepted_at=? WHERE event_id=?", (_now(), event_id))
+                            else:
+                                db.execute(
+                                    "UPDATE waiting_schedule SET started_at=?,pending_json=NULL WHERE forum_id=?",
+                                    (_now(), forum_id),
+                                )
                         result.update(notification_status="accepted", event_id=event_id)
                 result["pending_count"] = db.execute(
                     "SELECT COUNT(*) FROM outbox WHERE forum_id=? AND accepted_at IS NULL", (forum_id,),
+                ).fetchone()[0]
+                result["pending_count"] += db.execute(
+                    "SELECT COUNT(*) FROM waiting_schedule WHERE forum_id=? AND pending_json IS NOT NULL", (forum_id,),
                 ).fetchone()[0]
                 return result
         except sqlite3.Error:
@@ -77,25 +114,68 @@ class Monitor:
     def _connect(self):
         return sqlite3.connect(self.db_path, timeout=10)
 
-    def _store_observation(self, db, probe):
+    def _store_observation(self, db, probe, *, waiting_interval_seconds, waiting_message, update_message):
         forum_id = probe["forum_id"]
         row = db.execute("SELECT reviews_json FROM paper_state WHERE forum_id=?", (forum_id,)).fetchone()
         previous = json.loads(row[0]) if row else {}
         merged, added, modified = _merge_reviews(previous, probe["reviews"])
         changed = bool(added or modified)
+        now = _now()
         with db:
             db.execute(
                 "INSERT INTO paper_state(forum_id,reviews_json,updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(forum_id) DO UPDATE SET reviews_json=excluded.reviews_json,updated_at=excluded.updated_at",
-                (forum_id, json.dumps(merged, ensure_ascii=False), _now()),
+                (forum_id, json.dumps(merged, ensure_ascii=False), now),
             )
             if changed:
-                event = _notification(probe, first=not previous, added=bool(added), modified=bool(modified))
+                event = _notification(
+                    probe, first=not previous, added=bool(added), modified=bool(modified),
+                    update_message=update_message,
+                )
                 db.execute(
                     "INSERT INTO outbox(event_id,forum_id,payload_json,created_at) VALUES(?,?,?,?)",
-                    (event["id"], forum_id, json.dumps(event, ensure_ascii=False), _now()),
+                    (event["id"], forum_id, json.dumps(event, ensure_ascii=False), now),
                 )
+            _schedule_waiting(
+                db, probe, changed=changed, now=now,
+                interval=waiting_interval_seconds, message=waiting_message,
+            )
         return changed
+
+
+def _schedule_waiting(db, probe, *, changed, now, interval, message):
+    """Persist one waiting event at most; only successful observations reach here."""
+    forum_id = probe["forum_id"]
+    row = db.execute(
+        "SELECT started_at,pending_json FROM waiting_schedule WHERE forum_id=?", (forum_id,),
+    ).fetchone()
+    if changed or row is None or interval == 0:
+        db.execute(
+            "INSERT INTO waiting_schedule(forum_id,started_at,pending_json) VALUES(?,?,NULL) "
+            "ON CONFLICT(forum_id) DO UPDATE SET started_at=excluded.started_at,pending_json=NULL",
+            (forum_id, now),
+        )
+        return
+    if row[1]:
+        return
+    # Do not create encouragement while a score alert still needs delivery.
+    if db.execute(
+        "SELECT 1 FROM outbox WHERE forum_id=? AND accepted_at IS NULL LIMIT 1", (forum_id,),
+    ).fetchone():
+        return
+    elapsed = datetime.fromisoformat(now) - datetime.fromisoformat(row[0])
+    if elapsed.total_seconds() < interval:
+        return
+    event = {
+        "id": "iclr-waiting-" + uuid4().hex,
+        "title": "ICLR：继续等待", "body": message,
+        "url": "https://openreview.net/forum?" + urlencode({"id": forum_id}),
+        "group": "iclr-review-monitor",
+    }
+    db.execute(
+        "UPDATE waiting_schedule SET pending_json=? WHERE forum_id=?",
+        (json.dumps(event, ensure_ascii=False), forum_id),
+    )
 
 
 def _merge_reviews(previous, observed):
@@ -125,7 +205,7 @@ def _score_signature(review):
     return core._numeric_rating(review.get("rating")), normalized if normalized is not None else confidence
 
 
-def _notification(probe, *, first, added, modified):
+def _notification(probe, *, first, added, modified, update_message=DEFAULT_UPDATE_MESSAGE):
     if first:
         title = "ICLR：评审分数已可见"
     elif added and modified:
@@ -135,6 +215,7 @@ def _notification(probe, *, first, added, modified):
     else:
         title = "ICLR：评审分数或置信度更新"
     lines = [
+        update_message,
         str(probe["title"]),
         f"当前可见 {probe['review_count']} 份评审，可读评分 {probe['scored_review_count']} 份。",
     ]

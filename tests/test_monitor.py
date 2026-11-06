@@ -2,7 +2,7 @@
 
 from contextlib import closing
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -141,6 +141,213 @@ class MonitorTests(unittest.TestCase):
         send.assert_not_called()
         with closing(sqlite3.connect(self.db_path)) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox WHERE accepted_at IS NULL").fetchone()[0], 1)
+
+
+class WaitingReminderTests(unittest.TestCase):
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.db_path = Path(directory.name) / "monitor.sqlite3"
+        self.engine = monitor.Monitor(self.db_path)
+        self.time = datetime(2027, 1, 1, tzinfo=timezone.utc)
+        clock = patch.object(monitor, "_now", side_effect=lambda: self.time.isoformat())
+        clock.start()
+        self.addCleanup(clock.stop)
+        sender = patch.object(monitor, "send_notification")
+        self.send = sender.start()
+        self.addCleanup(sender.stop)
+
+    def advance(self, seconds):
+        self.time += timedelta(seconds=seconds)
+
+    def check(self, reviews=None, **options):
+        with patch.object(monitor, "probe_openreview", return_value=observation(reviews or [])):
+            return self.engine.check_once(PAPER, "", KEY, **options)
+
+    def test_first_success_starts_timer_and_only_exact_interval_sends_encouragement(self):
+        self.assertEqual(self.check()["notification_status"], "none")
+        self.advance(3599)
+        self.assertEqual(self.check()["notification_status"], "none")
+        self.send.assert_not_called()
+        self.advance(1)
+        result = self.check()
+        event = self.send.call_args.args[1]
+        self.assertEqual(result["notification_kind"], "waiting")
+        self.assertEqual(event["title"], "ICLR：继续等待")
+        self.assertEqual(event["body"], "继续等待，不要着急，不要担心，你是最棒的！")
+        self.assertEqual(event["url"], PAPER)
+        self.advance(3599)
+        self.assertEqual(self.check()["notification_status"], "none")
+        self.advance(1)
+        self.assertEqual(self.check()["notification_status"], "accepted")
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_restart_keeps_timer_and_a_long_gap_sends_only_one_reminder(self):
+        self.check()
+        self.advance(10800)
+        self.engine = monitor.Monitor(self.db_path)
+        self.assertEqual(self.check()["notification_status"], "accepted")
+        self.assertEqual(self.check()["notification_status"], "none")
+        self.advance(3599)
+        self.assertEqual(self.check()["notification_status"], "none")
+        self.advance(1)
+        self.assertEqual(self.check()["notification_status"], "accepted")
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_api_errors_do_not_schedule_or_send_a_due_or_pending_encouragement(self):
+        self.check()
+        self.advance(3600)
+        for code in ("network_error", "unauthorized", "challenge_required"):
+            with patch.object(monitor, "probe_openreview", side_effect=core.ProbeError(code, "safe")):
+                result = self.engine.check_once(PAPER, "", KEY)
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["notification_status"], "none")
+        self.send.assert_not_called()
+        self.send.side_effect = core.ProbeError("network_error", "safe")
+        self.assertEqual(self.check()["pending_count"], 1)
+        pending_event = deepcopy(self.send.call_args.args[1])
+        self.send.reset_mock()
+        with patch.object(monitor, "probe_openreview", side_effect=core.ProbeError("forbidden", "safe")):
+            self.engine.check_once(PAPER, "", KEY)
+        self.send.assert_not_called()
+        self.send.side_effect = None
+        self.assertEqual(self.check()["notification_status"], "accepted")
+        self.assertEqual(self.send.call_args.args[1], pending_event)
+
+    def test_failed_waiting_push_reuses_one_durable_event_after_restart(self):
+        self.check()
+        self.advance(3600)
+        self.send.side_effect = core.ProbeError("network_error", "safe")
+        self.assertEqual(self.check()["pending_count"], 1)
+        first_event = deepcopy(self.send.call_args.args[1])
+        self.advance(7200)
+        self.engine = monitor.Monitor(self.db_path)
+        self.assertEqual(self.check()["pending_count"], 1)
+        self.assertEqual(self.send.call_args.args[1], first_event)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            stored = db.execute("SELECT pending_json FROM waiting_schedule").fetchall()
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(json.loads(stored[0][0]), first_event)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.send.side_effect = None
+        self.assertEqual(self.check()["pending_count"], 0)
+        self.assertEqual(self.send.call_args.args[1], first_event)
+        self.assertEqual(self.check()["notification_status"], "none")
+        self.advance(3600)
+        self.check()
+        self.assertNotEqual(self.send.call_args.args[1]["id"], first_event["id"])
+
+    def test_score_arrival_at_deadline_preempts_waiting_and_resets_timer(self):
+        self.check()
+        self.advance(3600)
+        result = self.check([review()])
+        self.assertEqual(result["notification_kind"], "update")
+        self.assertEqual(self.send.call_count, 1)
+        event = self.send.call_args.args[1]
+        self.assertEqual(event["body"].splitlines()[0], "！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样")
+        self.assertIn("6: Weak Accept", event["body"])
+        self.advance(3599)
+        self.assertEqual(self.check([review()])["notification_status"], "none")
+        self.advance(1)
+        self.assertEqual(self.check([review()])["notification_kind"], "waiting")
+
+    def test_score_change_cancels_failed_waiting_event_and_confidence_resets_timer(self):
+        self.check()
+        self.advance(3600)
+        self.send.side_effect = core.ProbeError("network_error", "safe")
+        self.check()
+        waiting_id = self.send.call_args.args[1]["id"]
+        self.send.side_effect = None
+        self.advance(1)
+        result = self.check([review()])
+        self.assertEqual(result["notification_kind"], "update")
+        self.assertEqual(result["pending_count"], 0)
+        self.assertNotEqual(result["event_id"], waiting_id)
+        self.advance(3599)
+        confidence_change = [review(confidence="5: Very Confident")]
+        self.assertEqual(self.check(confidence_change)["notification_kind"], "update")
+        self.advance(3599)
+        self.assertEqual(self.check(confidence_change)["notification_status"], "none")
+        self.advance(1)
+        self.assertEqual(self.check(confidence_change)["notification_kind"], "waiting")
+        self.assertNotIn(waiting_id, [call.args[1]["id"] for call in self.send.call_args_list[1:]])
+
+    def test_pending_score_alert_prevents_encouragement_from_accumulating(self):
+        self.send.side_effect = core.ProbeError("network_error", "safe")
+        self.check([review()])
+        score_event = deepcopy(self.send.call_args.args[1])
+        self.advance(7200)
+        result = self.check([review()])
+        self.assertEqual(result["notification_kind"], "update")
+        self.assertEqual(result["pending_count"], 1)
+        self.assertEqual(self.send.call_args.args[1], score_event)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertIsNone(db.execute("SELECT pending_json FROM waiting_schedule").fetchone()[0])
+
+    def test_zero_interval_cancels_pending_waiting_and_never_disables_score_alerts(self):
+        self.check()
+        self.advance(3600)
+        self.send.side_effect = core.ProbeError("network_error", "safe")
+        self.check()
+        self.send.side_effect = None
+        self.send.reset_mock()
+        self.assertEqual(self.check(waiting_interval_seconds=0)["pending_count"], 0)
+        self.advance(7200)
+        self.assertEqual(self.check(waiting_interval_seconds=0)["notification_status"], "none")
+        self.send.assert_not_called()
+        self.assertEqual(self.check([review()], waiting_interval_seconds=0)["notification_kind"], "update")
+        self.advance(3600)
+        self.assertEqual(self.check([review()], waiting_interval_seconds=0)["notification_status"], "none")
+        self.assertEqual(self.send.call_count, 1)
+
+    def test_custom_interval_and_messages_preserve_score_details(self):
+        options = {"waiting_interval_seconds": 10, "waiting_message": "自定义等待原文！", "update_message": "自定义警报原文！"}
+        self.check([review()], **options)
+        event = self.send.call_args.args[1]
+        self.assertTrue(event["body"].startswith("自定义警报原文！\nExample paper\n"))
+        self.assertIn("置信度 4: Confident", event["body"])
+        self.assertEqual(event["url"], PAPER)
+        self.advance(9)
+        self.assertEqual(self.check([review()], **options)["notification_status"], "none")
+        self.advance(1)
+        self.check([review()], **options)
+        self.assertEqual(self.send.call_args.args[1]["body"], "自定义等待原文！")
+
+    def test_each_paper_has_an_independent_persistent_waiting_timer(self):
+        self.check()
+        self.advance(1800)
+        second = observation([])
+        second["forum_id"] = "DemoPaper02"
+        second_paper = "https://openreview.net/forum?id=DemoPaper02"
+        with patch.object(monitor, "probe_openreview", return_value=second):
+            self.engine.check_once(second_paper, "", KEY)
+        self.advance(1800)
+        self.assertEqual(self.check()["notification_kind"], "waiting")
+        with patch.object(monitor, "probe_openreview", return_value=second):
+            self.assertEqual(self.engine.check_once(second_paper, "", KEY)["notification_status"], "none")
+            self.advance(1800)
+            self.assertEqual(self.engine.check_once(second_paper, "", KEY)["notification_kind"], "waiting")
+        self.assertEqual(self.send.call_args.args[1]["url"], second_paper)
+
+    def test_existing_database_migrates_without_changing_snapshot_or_pending_score(self):
+        original = {"R1": review()}
+        pending = {"id": "legacy-score-event", "title": "旧评分通知", "body": "R1: 6", "url": PAPER}
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("DROP TABLE waiting_schedule")
+            db.execute("INSERT INTO paper_state VALUES(?,?,?)", ("DemoPaper01", json.dumps(original), self.time.isoformat()))
+            db.execute("INSERT INTO outbox VALUES(?,?,?,?,NULL)", (pending["id"], "DemoPaper01", json.dumps(pending), self.time.isoformat()))
+        self.engine = monitor.Monitor(self.db_path)
+        result = self.check([review()])
+        self.assertFalse(result["data_changed"])
+        self.assertEqual(self.send.call_args.args[1], pending)
+        self.assertEqual(result["pending_count"], 0)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(json.loads(db.execute("SELECT reviews_json FROM paper_state").fetchone()[0]), original)
+            self.assertIsNotNone(db.execute("SELECT accepted_at FROM outbox").fetchone()[0])
+        self.advance(3599)
+        self.assertEqual(self.check([review()])["notification_status"], "none")
+        self.advance(1)
+        self.assertEqual(self.check([review()])["notification_kind"], "waiting")
 
 
 class NotificationTransportTests(unittest.TestCase):

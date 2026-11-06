@@ -7,6 +7,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 from .core import ProbeError, parse_forum_id
+from .monitor import DEFAULT_UPDATE_MESSAGE, DEFAULT_WAITING_INTERVAL_SECONDS, DEFAULT_WAITING_MESSAGE
 from .web import PRIVATE_DIR, read_json, write_json
 
 SESSION_PATH = PRIVATE_DIR / "openreview-session.json"
@@ -30,9 +31,32 @@ def settings():
         "token": token,
         "bark_key": os.environ.get("BARK_DEVICE_KEY") or local.get("bark_key", ""),
         "interval": interval,
+        "waiting_interval_seconds": _waiting_interval(local),
+        "waiting_message": _message(local, "WAITING_MESSAGE", "waiting_message", DEFAULT_WAITING_MESSAGE),
+        "update_message": _message(local, "SCORE_UPDATE_MESSAGE", "update_message", DEFAULT_UPDATE_MESSAGE),
         "data_dir": data_dir,
         "db_path": data_dir / "monitor.sqlite3",
     }
+
+
+def _waiting_interval(local):
+    value = os.environ.get("WAITING_REMINDER_SECONDS", local.get("waiting_interval_seconds", DEFAULT_WAITING_INTERVAL_SECONDS))
+    try:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError
+        interval = int(value)
+    except ValueError:
+        raise ProbeError("invalid_config", "WAITING_REMINDER_SECONDS 必须是整数秒。") from None
+    if interval != 0 and not 60 <= interval <= 86400:
+        raise ProbeError("invalid_config", "等待提醒间隔应为 0（关闭），或 60 秒至 1 天。")
+    return interval
+
+
+def _message(local, environment, key, default):
+    value = os.environ.get(environment, local.get(key, default))
+    if not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        raise ProbeError("invalid_config", "通知文案必须是 1–2000 字符的非空文本。")
+    return value
 
 
 def require_paper(config):

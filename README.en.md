@@ -4,7 +4,7 @@
 
 [中文](README.md) · [Deployment guide](docs/DEPLOYMENT.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [MIT License](LICENSE)
 
-ICLR Alert monitors the official reviews currently visible to your OpenReview identity. When scores first become readable, another scored review appears, or an existing rating or confidence changes, it sends a notification through the existing [Bark iPhone app](https://github.com/Finb/Bark). You do not need to build, sign, or publish an iOS client.
+ICLR Alert monitors the official reviews currently visible to your OpenReview identity. When scores first become readable, another scored review appears, or an existing rating or confidence changes, it sends a notification through the existing [Bark iPhone app](https://github.com/Finb/Bark). While scores are unchanged, an hourly encouragement is enabled by default; you can disable it or customize the text. You do not need to build, sign, or publish an iOS client.
 
 The worker uses the Python standard library, OpenReview API v2, and SQLite. Run it locally, in Docker, or on Railway. **A local worker needs an online computer; a cloud worker continues when your computer is off.**
 
@@ -15,6 +15,7 @@ The worker uses the Python standard library, OpenReview API v2, and SQLite. Run 
 | First visible scores | Notifies even when scores already exist on the first run |
 | Review changes | Detects new scored reviews, rating changes, and confidence changes |
 | Useful notifications | Includes visible ratings, confidence, a computed average, and a paper link |
+| Waiting reminders | Encouragement every hour by default while scores are unchanged; score updates take priority |
 | Durable deduplication | SQLite stores snapshots and pending events across restarts |
 | Failure recovery | Backs off on network errors and retains unaccepted push events |
 | Authentication failures | Attempts a status alert and pauses for normal login or manual verification |
@@ -22,7 +23,7 @@ The worker uses the Python standard library, OpenReview API v2, and SQLite. Run 
 
 The current parser expects API v2 invitations ending in `/-/Official_Review`, with `rating` and `confidence` fields. Venues with different schemas need an adapter. Running on OpenReview alone does not establish compatibility.
 
-This is polling, with a **120-second** default interval. Polling, network requests, Bark, and Apple delivery all add latency. There is no instant-delivery or exactly-once guarantee. Averages are calculated by this program and are not official conference decisions.
+This is polling, with a **120-second** default check interval and a separate **3600-second** waiting-reminder interval. Due reminders are attempted at the next successful check, so polling, network requests, Bark, and Apple delivery add latency. There is no instant-delivery or exactly-once guarantee. Averages are calculated by this program and are not official conference decisions.
 
 ## Architecture
 
@@ -30,7 +31,7 @@ This is polling, with a **120-second** default interval. Polling, network reques
 flowchart LR
     A[OpenReview API v2] -->|Data visible to your identity| B[Python worker]
     B <--> C[(SQLite snapshots and outbox)]
-    B -->|Score change| D[Bark public service]
+    B -->|Score change or due waiting reminder| D[Bark public service]
     D --> E[iPhone notification]
 ```
 
@@ -38,12 +39,20 @@ Example notification, using **fictional demonstration scores**:
 
 ```text
 ICLR：评审分数已可见
+！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样
 A demo paper
 当前可见 3 份评审，可读评分 3 份。
 Reviewer_A：6: Weak Accept；置信度 4
 Reviewer_B：6: Weak Accept；置信度 3
 Reviewer_C：5: Borderline；置信度 4
 当前可读评分均值（本程序计算）：5.6667
+```
+
+Score alerts keep their event title, all score details, and the paper link. The configurable alert text is added as the first body line. The default waiting notification is:
+
+```text
+ICLR：继续等待
+继续等待，不要着急，不要担心，你是最棒的！
 ```
 
 The current interactive prompts and notifications are primarily Chinese. Notification times use Beijing time, UTC+8; worker logs use timezone-qualified UTC timestamps. The English README does not imply an English UI or configurable locale.
@@ -156,7 +165,7 @@ After installation, `iclr-alert` is equivalent to `python -m iclr_alert`.
 | `login` / `login-gui` | Windows login and read-only paper verification | No |
 | `probe [--paper URL]` | Read using the configured session | No |
 | `probe --anonymous` | Explicitly query without authentication | No |
-| `check` | Check once and process score events | Yes |
+| `check` | Check once and process score events or a due waiting reminder | Yes |
 | `watch` | Run continuous polling | Yes |
 | `status` | Show configuration flags and the last outcome without credentials | No |
 | `cloud-config` | Export private deployment variables locally; does not upload | No |
@@ -171,6 +180,9 @@ After installation, `iclr-alert` is equivalent to `python -m iclr_alert`.
 | `OPENREVIEW_TOKEN` | Unset | Normally issued session; overrides local session storage |
 | `BARK_DEVICE_KEY` | Unset | Key in the Bark push URL; overrides local configuration |
 | `CHECK_INTERVAL_SECONDS` | `120` | Integer from 60 through 86400 seconds |
+| `WAITING_REMINDER_SECONDS` | `3600` | Waiting-reminder interval; `0` disables it, otherwise an integer from 60 through 86400 seconds |
+| `WAITING_MESSAGE` | `继续等待，不要着急，不要担心，你是最棒的！` | Nonempty plain-text waiting body, at most 2000 characters |
+| `SCORE_UPDATE_MESSAGE` | Default alert text below | Nonempty plain-text first line of score-update bodies, at most 2000 characters |
 | `ICLR_CONFIG_DIR` | Project `.local` | Private configuration and Windows session directory; set before startup |
 | `DATA_DIR` | Configuration directory | Durable SQLite/status directory; use `/data` in a container |
 
@@ -178,14 +190,55 @@ Default private state:
 
 ```text
 .local/
-  config.json                 # Paper and Bark configuration
+  config.json                 # Paper, Bark, and optional reminder configuration
   openreview-session.json     # Windows DPAPI-protected session
-  monitor.sqlite3             # Snapshots and pending events
+  monitor.sqlite3             # Snapshots, pending events, and waiting-reminder clock
   monitor-status.json         # Last check result
   railway-variables.json      # Explicit cloud-config export; contains credentials
 ```
 
 Do not commit these files. If you override the configuration or data directory, protect that location too; repository ignore rules do not secure arbitrary external paths.
+
+### Configure waiting and score notifications
+
+The waiting clock starts with the first successful check and restarts after a score change. Its state persists across restarts. When the interval is due, the worker attempts a reminder at the next successful check. Score updates take priority. API failures do not produce a normal-waiting encouragement. A failed reminder is retried on a later successful check, without accumulating catch-up reminders for every missed hour. Ordinary Bark push failures do not trigger exponential polling backoff; server-specified `Retry-After` delays are still honored.
+
+The defaults are:
+
+```dotenv
+WAITING_REMINDER_SECONDS=3600
+WAITING_MESSAGE=继续等待，不要着急，不要担心，你是最棒的！
+SCORE_UPDATE_MESSAGE=！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样
+```
+
+Set them before starting the worker in PowerShell:
+
+```powershell
+$env:WAITING_REMINDER_SECONDS = '3600'
+$env:WAITING_MESSAGE = '继续等待，不要着急，不要担心，你是最棒的！'
+$env:SCORE_UPDATE_MESSAGE = '！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样'
+.\.venv\Scripts\python.exe -m iclr_alert watch
+```
+
+In a macOS / Linux shell:
+
+```bash
+export WAITING_REMINDER_SECONDS=3600
+export WAITING_MESSAGE='继续等待，不要着急，不要担心，你是最棒的！'
+export SCORE_UPDATE_MESSAGE='！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样'
+```
+
+Message values are plain text. Placeholders such as `{title}` or `{rating}` are not interpolated. Each message must contain non-whitespace content and be at most 2000 characters. Set `WAITING_REMINDER_SECONDS=0` if you only want score-change notifications. Docker / Compose users can put these values in `.env`; recreate an existing container to apply updated environment values.
+
+You can also add these fields to your existing `.local/config.json`, preserving its paper and Bark settings. The corresponding environment variables take precedence. `cloud-config` exports the resolved settings.
+
+```json
+{
+  "waiting_interval_seconds": 3600,
+  "waiting_message": "继续等待，不要着急，不要担心，你是最棒的！",
+  "update_message": "！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样"
+}
+```
 
 ## Docker and Railway
 
@@ -203,7 +256,7 @@ Compose explicitly loads `.env` and stores state in a named volume. Stop it with
 ### Railway
 
 1. Fork this repository and create a Railway service from your GitHub repository using its `Dockerfile`.
-2. Set `OPENREVIEW_PAPER`, `OPENREVIEW_TOKEN`, `BARK_DEVICE_KEY`, `CHECK_INTERVAL_SECONDS=120`, and `DATA_DIR=/data` as private platform variables.
+2. Set `OPENREVIEW_PAPER`, `OPENREVIEW_TOKEN`, `BARK_DEVICE_KEY`, `CHECK_INTERVAL_SECONDS=120`, and `DATA_DIR=/data` as private platform variables. Waiting reminders are enabled by default; optionally configure `WAITING_REMINDER_SECONDS`, `WAITING_MESSAGE`, and `SCORE_UPDATE_MESSAGE`.
 3. Attach a volume at `/data`, use one instance, disable sleeping, and do not configure a nonexistent HTTP health endpoint.
 4. Read runtime logs after deployment. A successful deployment alone does not prove API access; verify `status=ok` and the `reviews` / `scored` counts.
 
@@ -228,6 +281,10 @@ The tool requests a session of up to one week using the official API. The server
 ### Can notifications repeat or fail to arrive?
 
 Accepted events are persisted so restarts do not resend them. A timeout is ambiguous: the provider may already have accepted the request. Retries reuse the notification ID to reduce duplicates, without an exactly-once guarantee. Provider acceptance is also not a device receipt; phone permissions, connectivity, and the push system still matter.
+
+### Why did I receive a notification without a score change?
+
+By default, a “继续等待” encouragement is sent every 3600 seconds. It means that the check succeeded and a waiting reminder was due, not that new scores appeared. Disable it with `WAITING_REMINDER_SECONDS=0`. The separate `CHECK_INTERVAL_SECONDS` still controls API polling. API errors are not treated as normal waiting for encouragement notifications.
 
 ### Can I monitor multiple papers?
 

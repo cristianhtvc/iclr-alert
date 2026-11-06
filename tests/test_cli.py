@@ -24,6 +24,7 @@ class CliTests(unittest.TestCase):
             "bark_key": "private-bark-key-do-not-print",
             "interval": 120, "data_dir": self.private,
             "db_path": self.private / "monitor.sqlite3",
+            "waiting_interval_seconds": 7200, "waiting_message": "自定义等待", "update_message": "自定义更新",
         }
         for override in (
             patch.object(config_module, "settings", return_value=self.config),
@@ -125,6 +126,9 @@ class CliTests(unittest.TestCase):
             "BARK_DEVICE_KEY": self.config["bark_key"],
             "CHECK_INTERVAL_SECONDS": "120",
             "DATA_DIR": "/data",
+            "WAITING_REMINDER_SECONDS": "7200",
+            "WAITING_MESSAGE": "自定义等待",
+            "SCORE_UPDATE_MESSAGE": "自定义更新",
         })
         self.assert_no_secrets(output)
 
@@ -149,6 +153,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(public["bark_configured"])
         self.assertTrue(public["authenticated"])
         self.assertEqual(public["paper"], self.config["paper"])
+        self.assertEqual(public["waiting_reminder_seconds"], 7200)
         self.assertEqual(public["monitor"]["status"], "ok")
         self.assertEqual(public["login"]["status"], "authenticated")
         self.assert_no_secrets(output)

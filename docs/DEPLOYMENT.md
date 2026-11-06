@@ -2,7 +2,7 @@
 
 This guide covers persistent local, Docker, and Railway workers. For the Chinese getting-started guide, see [README.md](../README.md); for the English overview, see [README.en.md](../README.en.md).
 
-The application is a background worker, not a web server. It needs outbound HTTPS access to OpenReview and the Bark public service, a writable durable state directory, and one running process per state directory. It does not require a public domain or inbound port.
+The application is a background worker, not a web server. It needs outbound HTTPS access to OpenReview and the Bark public service, a writable durable state directory, and one running process per state directory. It does not require a public domain or inbound port. In addition to score alerts, an hourly waiting encouragement is enabled by default and can be disabled or customized.
 
 ## 1. Choose a deployment
 
@@ -107,6 +107,9 @@ variables = {
     "OPENREVIEW_TOKEN": session["token"],
     "BARK_DEVICE_KEY": config["bark_key"],
     "CHECK_INTERVAL_SECONDS": str(config["interval"]),
+    "WAITING_REMINDER_SECONDS": str(config["waiting_interval_seconds"]),
+    "WAITING_MESSAGE": config["waiting_message"],
+    "SCORE_UPDATE_MESSAGE": config["update_message"],
     "DATA_DIR": "/data",
 }
 PRIVATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -138,7 +141,16 @@ Copy the supplied example and edit it locally:
 cp cloud.env.example .env
 ```
 
-The file needs your paper, a currently valid session, and the Bark Device Key. `.env` is ignored by Git. The application does not read it by itself; the container tooling loads it explicitly.
+The file needs your paper, a currently valid session, and the Bark Device Key. `.env` is ignored by Git. The application does not read it by itself; the container tooling loads it explicitly. The example also includes the reminder settings:
+
+```dotenv
+CHECK_INTERVAL_SECONDS=120
+WAITING_REMINDER_SECONDS=3600
+WAITING_MESSAGE=继续等待，不要着急，不要担心，你是最棒的！
+SCORE_UPDATE_MESSAGE=！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样
+```
+
+`CHECK_INTERVAL_SECONDS` controls API polling. `WAITING_REMINDER_SECONDS` is a separate timer: `0` disables encouragement, or use an integer from 60 through 86400. Message values are plain text, with no `{title}` / `{rating}` template interpolation. The shown single-line default values work in both Compose `env_file` and Docker `--env-file`.
 
 ### Compose
 
@@ -181,6 +193,9 @@ The standard route uses the repository's `Dockerfile`; the project does not need
    | `OPENREVIEW_TOKEN` | Your normally issued session Token |
    | `BARK_DEVICE_KEY` | The Key in the Bark app's push URL |
    | `CHECK_INTERVAL_SECONDS` | `120`, or another integer from 60 to 86400 |
+   | `WAITING_REMINDER_SECONDS` | `3600`; `0` disables waiting reminders, otherwise an integer from 60 to 86400 |
+   | `WAITING_MESSAGE` | Optional plain-text waiting body; defaults to `继续等待，不要着急，不要担心，你是最棒的！` |
+   | `SCORE_UPDATE_MESSAGE` | Optional plain-text first line of score alerts; defaults to the alarm text shown below |
    | `DATA_DIR` | `/data` |
 
 5. Create a persistent volume and mount it at `/data`.
@@ -195,6 +210,39 @@ A healthy check resembles the following; the timestamp and counts here are illus
 ```
 
 `reviews=0` means no matching official reviews are visible to the current identity in that check. It is not evidence of the venue's overall release state. If scores were already visible, the first successful check can send a real notification.
+
+### Notification timing and text
+
+The default waiting title is `ICLR：继续等待`, with body `继续等待，不要着急，不要担心，你是最棒的！`. Score updates retain their original event title, scores, confidence, average, and paper link; the first line of their body is, by default:
+
+```text
+！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样
+```
+
+The waiting clock begins with the first successful check and resets after score changes. It is persisted with monitor state, so restarting the worker does not reset the clock. An interval becoming due does not create an independent exact-time job: the reminder is attempted at the next successful check, with the normal polling and network delay.
+
+Score updates take priority over encouragement. Failed API checks do not send a normal-waiting message. Failed reminders retry on later successful checks without accumulating one catch-up event for each missed interval.
+
+For a local PowerShell worker, set the values before starting it:
+
+```powershell
+$env:WAITING_REMINDER_SECONDS = '3600'
+$env:WAITING_MESSAGE = '继续等待，不要着急，不要担心，你是最棒的！'
+$env:SCORE_UPDATE_MESSAGE = '！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样'
+python -m iclr_alert watch
+```
+
+For a macOS / Linux shell:
+
+```bash
+export WAITING_REMINDER_SECONDS=3600
+export WAITING_MESSAGE='继续等待，不要着急，不要担心，你是最棒的！'
+export SCORE_UPDATE_MESSAGE='！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样'
+```
+
+For Docker or Railway, change the equivalent container/platform variables and recreate or redeploy the worker. Keep its state volume. These message settings are plain text, not formatting templates. Each must contain non-whitespace content and be at most 2000 characters.
+
+For local runs, the corresponding optional `.local/config.json` fields are `waiting_interval_seconds`, `waiting_message`, and `update_message`. Merge them into the existing file without removing its paper or Bark settings. Environment variables take precedence. Both Windows `cloud-config` and the cross-platform export example above use the resolved, validated settings. A Bark-only push failure does not increase the OpenReview polling backoff.
 
 Railway's official references: [Dockerfiles](https://docs.railway.com/builds/dockerfiles), [config as code](https://docs.railway.com/config-as-code/reference), [volumes](https://docs.railway.com/volumes), and [sleeping behavior](https://docs.railway.com/deployments/serverless).
 
@@ -235,13 +283,14 @@ Update the source, digest, and bootstrap variables together after running tests.
 | `bark_rejected` or pending push | Check the App Key and Bark service; pending events are retained for later successful checks |
 | `already_running` | Stop the duplicate process or give independent workers different state directories |
 | `storage_error` | Check the state-volume mount, permissions, free space, and persistence |
+| Waiting reminders are unwanted | Set `WAITING_REMINDER_SECONDS=0` and recreate or redeploy the worker |
 | Trial or quota exhaustion | Review hosting-account limits; the repository cannot extend credits or purchase service |
 
 An authentication/human-verification pause exits normally so an `ON_FAILURE` restart policy does not create a verification loop. Updating a Secret is not sufficient if the platform does not restart/redeploy the worker automatically; check that a new process is actually running.
 
 The worker attempts a deduplicated status alert before pausing. That alert can also fail if the Bark service or network is unavailable, so keep access to your provider's process state and logs.
 
-SQLite stores snapshots and an outbox before transmission. Accepted events remain accepted across restarts. An ambiguous timeout can still cause a repeated delivery; retries reuse the event ID, without an exactly-once guarantee. Run one process per database.
+SQLite stores snapshots, the waiting-reminder clock, and an outbox before transmission. Accepted events remain accepted across restarts. An ambiguous timeout can still cause a repeated delivery; retries reuse the event ID, without an exactly-once guarantee. Run one process per database.
 
 ## 8. Keep private data out of public repositories
 

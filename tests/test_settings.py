@@ -84,6 +84,42 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(config_module.load_session(), token)
         decrypt.assert_called_once_with(protected, protect=False)
 
+    def test_notification_defaults_and_local_then_environment_overrides(self):
+        default = config_module.settings()
+        self.assertEqual(default["waiting_interval_seconds"], 3600)
+        self.assertEqual(default["waiting_message"], "继续等待，不要着急，不要担心，你是最棒的！")
+        self.assertEqual(default["update_message"], "！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样")
+        self.local({"waiting_interval_seconds": 7200, "waiting_message": "本机等待", "update_message": "本机更新"})
+        local = config_module.settings()
+        self.assertEqual(local["waiting_interval_seconds"], 7200)
+        self.assertEqual(local["waiting_message"], "本机等待")
+        self.assertEqual(local["update_message"], "本机更新")
+        with patch.dict(os.environ, {"WAITING_REMINDER_SECONDS": "0", "WAITING_MESSAGE": "环境等待", "SCORE_UPDATE_MESSAGE": "环境更新"}):
+            environment = config_module.settings()
+        self.assertEqual(environment["waiting_interval_seconds"], 0)
+        self.assertEqual(environment["waiting_message"], "环境等待")
+        self.assertEqual(environment["update_message"], "环境更新")
+
+    def test_invalid_waiting_intervals_and_messages_fail_without_echoing_values(self):
+        for value in ("secret-invalid", "-1", "59", "86401", "3600.5", ""):
+            with self.subTest(interval=value), patch.dict(os.environ, {"WAITING_REMINDER_SECONDS": value}):
+                with self.assertRaises(ProbeError) as captured:
+                    config_module.settings()
+                self.assertEqual(captured.exception.code, "invalid_config")
+                self.assertNotIn("secret-invalid", str(captured.exception))
+        for value in ("0", "60", "86400"):
+            with patch.dict(os.environ, {"WAITING_REMINDER_SECONDS": value}):
+                self.assertEqual(config_module.settings()["waiting_interval_seconds"], int(value))
+        for value in (True, 3600.5):
+            self.local({"waiting_interval_seconds": value})
+            with self.assertRaises(ProbeError):
+                config_module.settings()
+        for value in ("", "  ", "secret-text" * 201, None):
+            self.local({"waiting_message": value})
+            with self.assertRaises(ProbeError) as captured:
+                config_module.settings()
+            self.assertNotIn("secret-text", str(captured.exception))
+
     def test_bad_sessions_fail_safely_without_calling_dpapi(self):
         malformed_sessions = (
             {"protected_token": "not valid base64"}, {"other": "private-value"},

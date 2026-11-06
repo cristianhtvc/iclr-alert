@@ -27,7 +27,11 @@ def run(watch=False, *, sleep=time.sleep):
         while True:
             config = settings()  # A refreshed local session takes effect on the next check.
             config["paper"] = require_paper(config)
-            result = monitor.check_once(config["paper"], config["token"], config["bark_key"])
+            result = monitor.check_once(
+                config["paper"], config["token"], config["bark_key"],
+                waiting_interval_seconds=config["waiting_interval_seconds"],
+                waiting_message=config["waiting_message"], update_message=config["update_message"],
+            )
             previous = read_json(status_path)
             if watch and result.get("action") in STOP_ACTIONS:
                 result["health_alert"] = _health_alert(config, result, previous)
@@ -35,10 +39,12 @@ def run(watch=False, *, sleep=time.sleep):
             write_json(status_path, result)
             # Logs contain outcome/counts only, not credentials, requests or review prose.
             probe = result.get("probe", {})
-            print(f"{result['updated_at']} status={result['status']} code={result.get('code', '-')} push={result['notification_status']} reviews={probe.get('review_count', '-')} scored={probe.get('scored_review_count', '-')}", flush=True)
+            print(f"{result['updated_at']} status={result['status']} code={result.get('code', '-')} push={result['notification_status']} kind={result.get('notification_kind', '-')} reviews={probe.get('review_count', '-')} scored={probe.get('scored_review_count', '-')}", flush=True)
             if not watch or result.get("action") in STOP_ACTIONS:
                 return result
-            failure_count = failure_count + 1 if result["status"] == "error" else 0
+            # A Bark failure must not slow otherwise healthy OpenReview checks.
+            read_failed = result["status"] == "error" and result.get("action") != "retry_push"
+            failure_count = failure_count + 1 if read_failed else 0
             delay = next_delay(config["interval"], failure_count, result.get("retry_after"))
             sleep(delay)
 

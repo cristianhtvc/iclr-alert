@@ -4,7 +4,7 @@
 
 [English](README.en.md) · [部署指南](docs/DEPLOYMENT.md) · [安全说明](SECURITY.md) · [参与贡献](CONTRIBUTING.md) · [MIT License](LICENSE)
 
-ICLR Alert 是一个个人评分监控工具：定期读取指定论文当前身份可见的正式评审，在评分首次可见、新增评审、改分或置信度变化时，通过现成的 [Bark](https://github.com/Finb/Bark) App 发送 iPhone 通知。无需自己开发、签名或上架 iOS 客户端。
+ICLR Alert 是一个个人评分监控工具：定期读取指定论文当前身份可见的正式评审，在评分首次可见、新增评审、改分或置信度变化时，通过现成的 [Bark](https://github.com/Finb/Bark) App 发送 iPhone 通知。等待期间，默认每小时发送一次鼓励提醒，可关闭或自定义文案。无需自己开发、签名或上架 iOS 客户端。
 
 它使用 Python 标准库、OpenReview API v2 和 SQLite；可以在电脑上运行，也可以用 Docker 或 Railway 持续运行。**本机运行需要电脑在线；部署到云端后，电脑可以关机。**
 
@@ -15,6 +15,7 @@ ICLR Alert 是一个个人评分监控工具：定期读取指定论文当前身
 | 评分首次可见 | 第一次运行时已经有评分，也会通知 |
 | 后续变化 | 识别新增评审、同一评审改分及 confidence 变化 |
 | 通知内容 | 当前可见各份评分、置信度、程序计算的均分及论文链接 |
+| 等待提醒 | 评分无变化时，默认每小时发送一次鼓励；评分更新优先 |
 | 持久化去重 | SQLite 保存快照和待发送事件，重启保留状态 |
 | 失败恢复 | 网络错误退避；Bark 未接受的事件保留在队列中 |
 | 身份失效 | 尝试发送状态提醒并暂停，等待重新登录或人工验证 |
@@ -22,7 +23,7 @@ ICLR Alert 是一个个人评分监控工具：定期读取指定论文当前身
 
 当前解析 API v2 中 invitation 以 `/-/Official_Review` 结尾的正式评审，读取 `rating` 和 `confidence`。其他会议若采用不同字段或表单，需要适配后才能使用，不能仅凭其运行在 OpenReview 上就认定兼容。
 
-这是轮询工具，默认每 **120 秒**检查一次。检测等待、网络、Bark 和 Apple 推送都会带来延迟，不保证瞬时或严格一次送达。均分是本程序计算结果，不代表会议最终决定。
+这是轮询工具，默认每 **120 秒**检查一次；等待提醒的默认间隔另为 **3600 秒**。到期提醒会在下一次成功检查时发送，因此还会受到轮询、网络、Bark 和 Apple 推送延迟的影响，不保证瞬时或严格一次送达。均分是本程序计算结果，不代表会议最终决定。
 
 ## 工作方式
 
@@ -30,7 +31,7 @@ ICLR Alert 是一个个人评分监控工具：定期读取指定论文当前身
 flowchart LR
     A[OpenReview API v2] -->|当前账号可见的数据| B[Python 监控进程]
     B <--> C[(SQLite 快照与待发送队列)]
-    B -->|发现评分变化| D[Bark 官方推送服务]
+    B -->|评分变化或等待提醒到期| D[Bark 官方推送服务]
     D --> E[iPhone Bark 通知]
 ```
 
@@ -38,12 +39,20 @@ flowchart LR
 
 ```text
 ICLR：评审分数已可见
+！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样
 A demo paper
 当前可见 3 份评审，可读评分 3 份。
 Reviewer_A：6: Weak Accept；置信度 4
 Reviewer_B：6: Weak Accept；置信度 3
 Reviewer_C：5: Borderline；置信度 4
 当前可读评分均值（本程序计算）：5.6667
+```
+
+评分提醒保留原来的事件标题、所有评分内容和论文链接，并在正文第一行加入上面的警报文案。默认等待提醒如下：
+
+```text
+ICLR：继续等待
+继续等待，不要着急，不要担心，你是最棒的！
 ```
 
 当前通知和交互提示主要为中文；通知时间使用北京时间（UTC+8），程序日志使用带时区的 UTC 时间。
@@ -156,7 +165,7 @@ python -m iclr_alert bark-key
 | `login` / `login-gui` | Windows 正常登录并验证论文 API | 否 |
 | `probe [--paper URL]` | 只读查询，使用已配置会话 | 否 |
 | `probe --anonymous` | 显式以匿名身份查询 | 否 |
-| `check` | 检查一次并处理评分通知 | 是 |
+| `check` | 检查一次并处理评分通知及到期的等待提醒 | 是 |
 | `watch` | 连续检查 | 是 |
 | `status` | 查看配置标记及上次监控结果，不回显凭据 | 否 |
 | `cloud-config` | 在本机导出私有部署变量 JSON，不上传 | 否 |
@@ -171,6 +180,9 @@ python -m iclr_alert bark-key
 | `OPENREVIEW_TOKEN` | 无 | 正常认证获得的会话；优先于本机加密会话 |
 | `BARK_DEVICE_KEY` | 无 | Bark App 推送地址中的 Key；优先于本机配置 |
 | `CHECK_INTERVAL_SECONDS` | `120` | 60–86400 秒之间的整数 |
+| `WAITING_REMINDER_SECONDS` | `3600` | 等待提醒间隔；`0` 关闭，其余为 60–86400 秒之间的整数 |
+| `WAITING_MESSAGE` | `继续等待，不要着急，不要担心，你是最棒的！` | 等待提醒正文，非空纯文本，最多 2000 字符 |
+| `SCORE_UPDATE_MESSAGE` | 下方默认警报文案 | 每条评分更新正文的第一行，非空纯文本，最多 2000 字符 |
 | `ICLR_CONFIG_DIR` | 项目 `.local` | 私有配置和 Windows 会话目录；在启动前设置 |
 | `DATA_DIR` | 配置目录 | SQLite 与监控状态目录；云端建议 `/data` |
 
@@ -178,14 +190,55 @@ python -m iclr_alert bark-key
 
 ```text
 .local/
-  config.json                 # 论文与 Bark 配置
+  config.json                 # 论文、Bark 与可选提醒配置
   openreview-session.json     # Windows DPAPI 加密会话
-  monitor.sqlite3             # 快照与待发送事件
+  monitor.sqlite3             # 快照、待发送事件与等待提醒时钟
   monitor-status.json         # 上次检查结果
   railway-variables.json      # 仅运行 cloud-config 后生成，含部署凭据
 ```
 
 不要提交这些文件。自定义 `ICLR_CONFIG_DIR` 或 `DATA_DIR` 后，也需要自行保护新目录，不能仅依赖仓库的 `.gitignore`。
+
+### 等待与评分提醒配置
+
+等待提醒从首次成功检查开始计时，评分变化后重新起算；计时状态持久化，重启不会清零。达到间隔后，在下一次成功检查时尝试发送。评分更新优先；API 请求失败时不会发送表示正常等待的鼓励通知。提醒发送失败会在后续成功检查时重试，不按错过的小时数积累补发。普通 Bark 推送失败不会触发评分轮询的指数退避；服务端要求的 `Retry-After` 等待时间仍会遵守。
+
+默认文案与间隔为：
+
+```dotenv
+WAITING_REMINDER_SECONDS=3600
+WAITING_MESSAGE=继续等待，不要着急，不要担心，你是最棒的！
+SCORE_UPDATE_MESSAGE=！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样
+```
+
+PowerShell 中可在启动前设置：
+
+```powershell
+$env:WAITING_REMINDER_SECONDS = '3600'
+$env:WAITING_MESSAGE = '继续等待，不要着急，不要担心，你是最棒的！'
+$env:SCORE_UPDATE_MESSAGE = '！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样'
+.\.venv\Scripts\python.exe -m iclr_alert watch
+```
+
+macOS / Linux shell 中对应为：
+
+```bash
+export WAITING_REMINDER_SECONDS=3600
+export WAITING_MESSAGE='继续等待，不要着急，不要担心，你是最棒的！'
+export SCORE_UPDATE_MESSAGE='！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样'
+```
+
+这些消息参数按纯文本使用，不提供 `{title}`、`{rating}` 等模板插值；文案必须包含非空白内容，且最多 2000 字符。只想收到评分变化时，将 `WAITING_REMINDER_SECONDS` 设为 `0`。Docker / Compose 用户可把相同配置写入 `.env`；已有容器需要重新创建后才能获得新的环境变量。
+
+本机也可在现有 `.local/config.json` 中加入以下字段，保留已有论文与 Bark 配置。相应环境变量优先于本机字段；`cloud-config` 会导出解析后的设置。
+
+```json
+{
+  "waiting_interval_seconds": 3600,
+  "waiting_message": "继续等待，不要着急，不要担心，你是最棒的！",
+  "update_message": "！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样"
+}
+```
 
 ## Docker 与 Railway
 
@@ -203,7 +256,7 @@ Compose 会显式加载 `.env`，并将监控状态保存到命名卷。使用 `
 ### Railway
 
 1. Fork 本仓库，用 Railway 从自己的 GitHub 仓库创建服务，使用项目内 `Dockerfile`。
-2. 在平台私有变量中配置 `OPENREVIEW_PAPER`、`OPENREVIEW_TOKEN`、`BARK_DEVICE_KEY`、`CHECK_INTERVAL_SECONDS=120` 和 `DATA_DIR=/data`。
+2. 在平台私有变量中配置 `OPENREVIEW_PAPER`、`OPENREVIEW_TOKEN`、`BARK_DEVICE_KEY`、`CHECK_INTERVAL_SECONDS=120` 和 `DATA_DIR=/data`；等待提醒默认开启，可另设 `WAITING_REMINDER_SECONDS`、`WAITING_MESSAGE`、`SCORE_UPDATE_MESSAGE`。
 3. 添加持久卷并挂载 `/data`；只运行一个实例，关闭自动休眠，不配置不存在的 HTTP 健康检查端点。
 4. 启动后检查实际运行日志，确认出现 `status=ok` 及合理的 `reviews` / `scored` 计数。
 
@@ -228,6 +281,10 @@ Windows 用户可以运行 `python -m iclr_alert cloud-config`，在 `.local/rai
 ### 通知会重复或漏发吗？
 
 已被服务接受的事件会持久化标记，重启保留该状态。若请求超时，服务可能已接受但客户端尚未收到响应；重试复用同一通知 ID 来减少重复，不能保证严格一次送达。Bark 服务接受也不等于 iPhone 已显示，手机权限、网络和推送服务仍会影响结果。
+
+### 为什么没有更新评分也收到了通知？
+
+默认每 3600 秒发送一次“继续等待”鼓励提醒。它表示这一轮查询成功、等待提醒已到期，不代表出现新评分。可以用 `WAITING_REMINDER_SECONDS=0` 关闭；查询周期仍由独立的 `CHECK_INTERVAL_SECONDS` 控制。API 错误不会被当作正常等待来发送鼓励。
 
 ### 能同时监控多篇论文吗？
 

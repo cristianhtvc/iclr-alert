@@ -50,6 +50,7 @@ class RunnerTests(unittest.TestCase):
             "token": "private-session-token", "bark_key": "private-bark-key",
             "interval": 120, "data_dir": self.data_dir,
             "db_path": self.data_dir / "monitor.sqlite3",
+            "waiting_interval_seconds": 3600, "waiting_message": "等待文案", "update_message": "更新文案",
         }
         self.monitor = Mock()
         self.settings_patch = patch.object(runner, "settings", return_value=self.config)
@@ -61,7 +62,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_challenge_stops_polling_and_restart_deduplicates_health_alert(self):
         failure = result("challenge_required", "access_verification")
-        self.monitor.check_once.side_effect = lambda *args: deepcopy(failure)
+        self.monitor.check_once.side_effect = lambda *args, **kwargs: deepcopy(failure)
         sleep = Mock()
         output = io.StringIO()
         with patch.object(runner, "send_notification") as send, redirect_stdout(output):
@@ -98,7 +99,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(returned["action"], "needs_auth")
 
     def test_failed_health_alert_can_retry_on_restart_with_same_event_id(self):
-        self.monitor.check_once.side_effect = lambda *args: result("unauthorized", "needs_auth")
+        self.monitor.check_once.side_effect = lambda *args, **kwargs: result("unauthorized", "needs_auth")
         with patch.object(runner, "send_notification", side_effect=ProbeError("network_error", "safe")) as failed:
             with redirect_stdout(io.StringIO()):
                 first = runner.run(watch=True, sleep=Mock())
@@ -109,6 +110,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(second["health_alert"], "accepted")
         self.assertEqual(retried.call_args.args[1]["id"], first_id)
 
+    def test_push_failures_do_not_slow_score_polling(self):
+        self.monitor.check_once.side_effect = [
+            result("network_error", "retry_push"),
+            result("bark_rejected", "retry_push"),
+            result("unauthorized", "needs_auth"),
+        ]
+        sleep = Mock()
+        with patch.object(runner, "send_notification"), redirect_stdout(io.StringIO()):
+            returned = runner.run(watch=True, sleep=sleep)
+        self.assertEqual(sleep.call_args_list, [call(120), call(120)])
+        self.assertEqual(returned["action"], "needs_auth")
+
     def test_one_shot_checks_once_without_sleep_or_health_notification(self):
         self.monitor.check_once.return_value = result("unauthorized", "needs_auth")
         sleep = Mock()
@@ -116,7 +129,8 @@ class RunnerTests(unittest.TestCase):
             returned = runner.run(watch=False, sleep=sleep)
         self.assertEqual(returned["status"], "error")
         self.monitor.check_once.assert_called_once_with(
-            self.config["paper"], self.config["token"], self.config["bark_key"]
+            self.config["paper"], self.config["token"], self.config["bark_key"],
+            waiting_interval_seconds=3600, waiting_message="等待文案", update_message="更新文案",
         )
         sleep.assert_not_called()
         send.assert_not_called()

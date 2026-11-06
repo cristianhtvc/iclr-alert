@@ -22,7 +22,7 @@ def main():
     subparsers.add_parser("login-gui", help="Open the local interactive login window")
     subparsers.add_parser("bark-key", help="Set the original Device Key shown in the Bark app")
     subparsers.add_parser("bark-test", help="Send one explicit test to the configured Bark device")
-    subparsers.add_parser("check", help="Check once and notify if scores changed")
+    subparsers.add_parser("check", help="Check once and process score changes or due waiting reminders")
     subparsers.add_parser("watch", help="Poll continuously; stop on auth or access-verification errors")
     subparsers.add_parser("status", help="Show safe configuration flags and monitoring status")
     subparsers.add_parser("cloud-config", help="Prepare a private Railway variables file; never upload or print secrets")
@@ -97,7 +97,7 @@ def execute(args):
         output(send_bark_test(config["bark_key"]))
         return 0
     if args.command == "status":
-        output({"bark_configured": bool(config["bark_key"]), "authenticated": bool(config["token"]), "paper": config["paper"], "interval_seconds": config["interval"], "monitor": read_json(config["data_dir"] / "monitor-status.json"), "login": read_json(PRIVATE_DIR / "auth-status.json")})
+        output({"bark_configured": bool(config["bark_key"]), "authenticated": bool(config["token"]), "paper": config["paper"], "interval_seconds": config["interval"], "waiting_reminder_seconds": config["waiting_interval_seconds"], "monitor": read_json(config["data_dir"] / "monitor-status.json"), "login": read_json(PRIVATE_DIR / "auth-status.json")})
         return 0
     if args.command == "probe":
         paper = require_paper({"paper": args.paper or config["paper"]})
@@ -111,6 +111,8 @@ def execute(args):
         write_json(target, {
             "OPENREVIEW_PAPER": config["paper"], "OPENREVIEW_TOKEN": config["token"],
             "BARK_DEVICE_KEY": config["bark_key"], "CHECK_INTERVAL_SECONDS": str(config["interval"]), "DATA_DIR": "/data",
+            "WAITING_REMINDER_SECONDS": str(config["waiting_interval_seconds"]),
+            "WAITING_MESSAGE": config["waiting_message"], "SCORE_UPDATE_MESSAGE": config["update_message"],
         })
         output({"status": "prepared", "path": str(target), "uploaded": False, "message": "私有变量文件已生成，未输出或上传凭据；不要加入源码或压缩包。"})
         return 0
