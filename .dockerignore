@@ -1,0 +1,10 @@
+.local
+.env
+.env.*
+work
+tests
+__pycache__
+**/__pycache__
+.venv
+.git
+*.zip

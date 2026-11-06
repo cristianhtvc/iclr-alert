@@ -1,0 +1,13 @@
+services:
+  monitor:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - monitor-data:/data
+    restart: "no"
+
+volumes:
+  monitor-data:
