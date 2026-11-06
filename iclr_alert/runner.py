@@ -39,8 +39,8 @@ def run(watch=False, *, sleep=time.sleep):
             write_json(status_path, result)
             # Logs contain outcome/counts only, not credentials, requests or review prose.
             probe = result.get("probe", {})
-            print(f"{result['updated_at']} status={result['status']} code={result.get('code', '-')} push={result['notification_status']} kind={result.get('notification_kind', '-')} reviews={probe.get('review_count', '-')} scored={probe.get('scored_review_count', '-')}", flush=True)
-            if not watch or result.get("action") in STOP_ACTIONS:
+            print(f"{result['updated_at']} status={result['status']} action={result.get('action', '-')} code={result.get('code', '-')} push={result['notification_status']} kind={result.get('notification_kind', '-')} reviews={probe.get('review_count', '-')} scored={probe.get('scored_review_count', '-')}", flush=True)
+            if not watch or result.get("action") in STOP_ACTIONS or result.get("action") == "completed":
                 return result
             # A Bark failure must not slow otherwise healthy OpenReview checks.
             read_failed = result["status"] == "error" and result.get("action") != "retry_push"

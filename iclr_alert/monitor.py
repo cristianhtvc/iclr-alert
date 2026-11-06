@@ -54,19 +54,36 @@ class Monitor:
     ) -> dict:
         try:
             forum_id = core.parse_forum_id(paper)
-            probe = probe_openreview(paper, token)
         except ProbeError as error:
             return _failure(error)
         try:
             with closing(self._connect()) as db:
-                changed = self._store_observation(
-                    db, probe, waiting_interval_seconds=waiting_interval_seconds,
-                    waiting_message=waiting_message, update_message=update_message,
-                )
+                # The durable score snapshot also marks the end of waiting. Check it
+                # before the API so completed tasks and pending pushes do not depend
+                # on an OpenReview session that may have expired since scores arrived.
+                row = db.execute("SELECT reviews_json FROM paper_state WHERE forum_id=?", (forum_id,)).fetchone()
+                has_scores = bool(row and json.loads(row[0]))
+                changed = False
+                probe = None
+                if not has_scores:
+                    try:
+                        probe = probe_openreview(paper, token)
+                    except ProbeError as error:
+                        return _failure(error)
+                    changed, has_scores = self._store_observation(
+                        db, probe, waiting_interval_seconds=waiting_interval_seconds,
+                        waiting_message=waiting_message, update_message=update_message,
+                    )
+                if has_scores:
+                    # This also removes waiting events left by older versions.
+                    with db:
+                        db.execute("DELETE FROM waiting_schedule WHERE forum_id=?", (forum_id,))
                 result = {
                     "status": "ok", "data_changed": changed,
-                    "notification_status": "none", "probe": probe,
+                    "notification_status": "none",
                 }
+                if probe is not None:
+                    result["probe"] = probe
                 # One attempt per check. A timeout can still have reached the provider;
                 # retries reuse the stored event ID, without claiming exactly-once delivery.
                 pending = db.execute(
@@ -107,6 +124,8 @@ class Monitor:
                 result["pending_count"] += db.execute(
                     "SELECT COUNT(*) FROM waiting_schedule WHERE forum_id=? AND pending_json IS NOT NULL", (forum_id,),
                 ).fetchone()[0]
+                if has_scores and result["pending_count"] == 0:
+                    result.update(action="completed", message="评分已可见，评分通知已获 Bark 接受，监控已完成。")
                 return result
         except sqlite3.Error:
             return _failure(ProbeError("storage_error", "监控状态无法保存，请检查持久化磁盘。"))
@@ -136,20 +155,23 @@ class Monitor:
                     "INSERT INTO outbox(event_id,forum_id,payload_json,created_at) VALUES(?,?,?,?)",
                     (event["id"], forum_id, json.dumps(event, ensure_ascii=False), now),
                 )
-            _schedule_waiting(
-                db, probe, changed=changed, now=now,
-                interval=waiting_interval_seconds, message=waiting_message,
-            )
-        return changed
+            if merged:
+                db.execute("DELETE FROM waiting_schedule WHERE forum_id=?", (forum_id,))
+            else:
+                _schedule_waiting(
+                    db, probe, now=now,
+                    interval=waiting_interval_seconds, message=waiting_message,
+                )
+        return changed, bool(merged)
 
 
-def _schedule_waiting(db, probe, *, changed, now, interval, message):
+def _schedule_waiting(db, probe, *, now, interval, message):
     """Persist one waiting event at most; only successful observations reach here."""
     forum_id = probe["forum_id"]
     row = db.execute(
         "SELECT started_at,pending_json FROM waiting_schedule WHERE forum_id=?", (forum_id,),
     ).fetchone()
-    if changed or row is None or interval == 0:
+    if row is None or interval == 0:
         db.execute(
             "INSERT INTO waiting_schedule(forum_id,started_at,pending_json) VALUES(?,?,NULL) "
             "ON CONFLICT(forum_id) DO UPDATE SET started_at=excluded.started_at,pending_json=NULL",

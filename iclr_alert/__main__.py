@@ -23,7 +23,7 @@ def main():
     subparsers.add_parser("bark-key", help="Set the original Device Key shown in the Bark app")
     subparsers.add_parser("bark-test", help="Send one explicit test to the configured Bark device")
     subparsers.add_parser("check", help="Check once and process score changes or due waiting reminders")
-    subparsers.add_parser("watch", help="Poll continuously; stop on auth or access-verification errors")
+    subparsers.add_parser("watch", help="Poll until scores are notified; stop on completion, auth or access-verification errors")
     subparsers.add_parser("status", help="Show safe configuration flags and monitoring status")
     subparsers.add_parser("cloud-config", help="Prepare a private Railway variables file; never upload or print secrets")
     serve = subparsers.add_parser("serve", help="Open the local configuration service")

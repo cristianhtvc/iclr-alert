@@ -1,16 +1,18 @@
 """CLI outcomes and explicit private cloud export, with no authentication or pushes."""
 
 from contextlib import redirect_stdout
+from contextlib import closing
 from copy import deepcopy
 import io
 import json
+import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 from iclr_alert import __main__ as cli
-from iclr_alert import runner, settings as config_module, web
+from iclr_alert import monitor, runner, settings as config_module, web
 
 
 class CliTests(unittest.TestCase):
@@ -51,6 +53,31 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             run.assert_called_once_with(watch=True)
             self.assert_no_secrets(output)
+
+    def test_watch_with_legacy_delivered_scores_exits_zero_without_network(self):
+        monitor.Monitor(self.config["db_path"])
+        with closing(sqlite3.connect(self.config["db_path"])) as db, db:
+            db.execute(
+                "INSERT INTO paper_state VALUES(?,?,?)",
+                ("DemoPaper01", json.dumps({"R1": {"id": "R1", "rating": 6}}), "2026-01-01T00:00:00+00:00"),
+            )
+            db.execute(
+                "INSERT INTO outbox VALUES(?,?,?,?,?)",
+                ("legacy-score", "DemoPaper01", "{}", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00"),
+            )
+        self.config["token"] = ""
+        with (
+            patch.object(runner, "settings", return_value=self.config),
+            patch.object(monitor, "probe_openreview") as probe,
+            patch.object(monitor, "send_notification") as push,
+        ):
+            code, output = self.invoke("watch")
+        self.assertEqual(code, 0)
+        probe.assert_not_called()
+        push.assert_not_called()
+        self.assertIn("action=completed", output)
+        self.assertEqual(json.loads((self.private / "monitor-status.json").read_text())["action"], "completed")
+        self.assertNotIn(self.config["bark_key"], output)
 
     def test_check_failure_exits_two_and_reports_safe_result(self):
         failure = {

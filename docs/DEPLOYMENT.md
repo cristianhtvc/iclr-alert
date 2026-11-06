@@ -2,7 +2,7 @@
 
 This guide covers persistent local, Docker, and Railway workers. For the Chinese getting-started guide, see [README.md](../README.md); for the English overview, see [README.en.md](../README.en.md).
 
-The application is a background worker, not a web server. It needs outbound HTTPS access to OpenReview and the Bark public service, a writable durable state directory, and one running process per state directory. It does not require a public domain or inbound port. In addition to score alerts, an hourly waiting encouragement is enabled by default and can be disabled or customized.
+The application is a background worker, not a web server. It needs outbound HTTPS access to OpenReview and the Bark public service, a writable durable state directory, and one running process per state directory. It does not require a public domain or inbound port. An hourly waiting encouragement is enabled by default only until at least one numeric rating becomes readable, and can be disabled or customized. After Bark accepts the score alerts and the pending score queue is empty, the task completes and exits normally. It does not monitor later reviews or score changes.
 
 ## 1. Choose a deployment
 
@@ -75,7 +75,7 @@ run(watch=True)
 python .local/run_session.py
 ```
 
-This starts real monitoring and may send score notifications. The session is held in that process's environment, not exported to the parent shell or saved for the next run. Stop with Ctrl+C. Run the login again for a new session.
+This starts real monitoring and may send score notifications. The session is held in that process's environment, not exported to the parent shell or saved for the next run. The worker stops automatically after its score alert is accepted; Ctrl+C can stop it earlier. Run the login again if an unfinished task needs a new session.
 
 Do not pipe the script into `python -` when using its interactive account prompt: the script would occupy standard input. Save it as a file, as shown above.
 
@@ -160,7 +160,7 @@ docker compose logs -f
 docker compose stop
 ```
 
-The supplied Compose file loads `.env`, mounts durable state at `/data`, and avoids unconditional restarts after a human-action pause. Do not add a public port just to make the background process look like a web application.
+The supplied Compose file loads `.env`, mounts durable state at `/data`, and avoids unconditional restarts after task completion or a human-action pause. Do not add a public port just to make the background process look like a web application.
 
 ### Plain Docker
 
@@ -201,27 +201,32 @@ The standard route uses the repository's `Dockerfile`; the project does not need
 5. Create a persistent volume and mount it at `/data`.
 6. Keep one running instance. Disable service sleeping: this worker cannot be awakened by a scheduled inbound browser request.
 7. Do not add an HTTP healthcheck path unless you implement a real HTTP endpoint. This application does not listen on a port.
-8. Deploy, then inspect runtime logs rather than relying only on the deployment badge.
+8. Keep the `ON_FAILURE` restart policy from `railway.json`; do not use `ALWAYS`. Task completion is a successful process exit, not a crash.
+9. Deploy, then inspect runtime logs rather than relying only on the deployment badge.
 
 A healthy check resembles the following; the timestamp and counts here are illustrative:
 
 ```text
-... status=ok code=- push=none reviews=0 scored=0
+... status=ok code=- action=- push=none kind=- reviews=0 scored=0
 ```
 
-`reviews=0` means no matching official reviews are visible to the current identity in that check. It is not evidence of the venue's overall release state. If scores were already visible, the first successful check can send a real notification.
+`reviews=0` means no matching official reviews are visible to the current identity in that check. It is not evidence of the venue's overall release state. If scores were already visible, the first successful check can send a real notification. Once score alerts are accepted and the score outbox is empty, the log includes `status=ok` and `action=completed`, and `watch` exits with code `0`. The same outcome is recorded in `/data/monitor-status.json`. A completed worker is expected to stop; keep its `/data` volume.
 
 ### Notification timing and text
 
-The default waiting title is `ICLR：继续等待`, with body `继续等待，不要着急，不要担心，你是最棒的！`. Score updates retain their original event title, scores, confidence, average, and paper link; the first line of their body is, by default:
+The default waiting title is `ICLR：继续等待`, with body `继续等待，不要着急，不要担心，你是最棒的！`. Score alerts include the currently visible scores, confidence, average, and paper link; the first line of their body is, by default:
 
 ```text
 ！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样
 ```
 
-The waiting clock begins with the first successful check and resets after score changes. It is persisted with monitor state, so restarting the worker does not reset the clock. An interval becoming due does not create an independent exact-time job: the reminder is attempted at the next successful check, with the normal polling and network delay.
+The waiting clock begins with the first successful check that has no readable numeric rating. It is persisted with monitor state, so restarting the unfinished worker does not reset the clock. A due reminder is attempted at the next successful check, with the normal polling and network delay.
 
-Score updates take priority over encouragement. Failed API checks do not send a normal-waiting message. Failed reminders retry on later successful checks without accumulating one catch-up event for each missed interval.
+As soon as at least one numeric rating is readable, the worker clears that paper's waiting reminders, including pending reminders from an older deployment. It sends the score alert and completes only after Bark has accepted all pending score events. Failed score pushes retain the same event ID and retry; they do not complete the task prematurely. Stored scores allow these retries without another OpenReview request, even if the session has expired.
+
+Restarting a completed task uses SQLite state and makes no OpenReview request or push. Preserve the existing `/data` volume when upgrading: previously recorded scores and accepted events are sufficient to recognize completion, without resending accepted notifications. After completion, later reviews or score changes are not monitored.
+
+Failed API checks do not send a normal-waiting message. Before scores appear, failed waiting reminders retry on later successful checks without accumulating one catch-up event for each missed interval.
 
 For a local PowerShell worker, set the values before starting it:
 
@@ -271,7 +276,7 @@ python -c "import base64,os; exec(compile(base64.b64decode(os.environ['ICLR_BOOT
 
 Also supply the separate private authentication/push variables and `/data` volume from the standard deployment. The loader validates the source digest, allowed paths, file counts, and size limits before writing files, then starts the worker. A SHA-256 check establishes consistency of that bundle; it is not an independent signature or substitute for reviewing the source and controlling access to deployment variables.
 
-Update the source, digest, and bootstrap variables together after running tests. The worker is still the same Python application. This route does not make authentication challenges disappear or eliminate normal hosting charges.
+After running tests, regenerate the bundle from the updated checkout and update `ICLR_SOURCE_B64`, `ICLR_SOURCE_SHA256`, and `ICLR_BOOTSTRAP_B64` together, along with the generated Python runtime flags. Redeploy the service so the new process loads the new bundle, retaining its existing private authentication/push variables and `/data` volume. Updating GitHub alone does not update a service that boots from source variables. The worker is still the same Python application. This route does not make authentication challenges disappear or eliminate normal hosting charges.
 
 ## 7. Maintenance and recovery
 
@@ -280,17 +285,18 @@ Update the source, digest, and bootstrap variables together after running tests.
 | `unauthorized` / `needs_auth` | Log in normally, update the deployed session Secret, and start a fresh worker |
 | `challenge_required` / `access_verification` | Use the official manual verification path; confirm supported API access before resuming |
 | `network_error` / service error | The worker backs off; inspect provider/OpenReview connectivity if it persists |
-| `bark_rejected` or pending push | Check the App Key and Bark service; pending events are retained for later successful checks |
+| `bark_rejected` or pending push | Check the App Key and Bark service; pending events retain their IDs and retry before task completion |
+| `action=completed` | Expected successful stop after scores are found and score alerts accepted; retain `/data` to preserve completion |
 | `already_running` | Stop the duplicate process or give independent workers different state directories |
 | `storage_error` | Check the state-volume mount, permissions, free space, and persistence |
 | Waiting reminders are unwanted | Set `WAITING_REMINDER_SECONDS=0` and recreate or redeploy the worker |
 | Trial or quota exhaustion | Review hosting-account limits; the repository cannot extend credits or purchase service |
 
-An authentication/human-verification pause exits normally so an `ON_FAILURE` restart policy does not create a verification loop. Updating a Secret is not sufficient if the platform does not restart/redeploy the worker automatically; check that a new process is actually running.
+Task completion and an authentication/human-verification pause both exit normally. Keep `ON_FAILURE` rather than `ALWAYS` so successful completion does not create a restart loop. Updating a Secret is not sufficient if the platform does not restart/redeploy the worker automatically; check that a new process is actually running.
 
 The worker attempts a deduplicated status alert before pausing. That alert can also fail if the Bark service or network is unavailable, so keep access to your provider's process state and logs.
 
-SQLite stores snapshots, the waiting-reminder clock, and an outbox before transmission. Accepted events remain accepted across restarts. An ambiguous timeout can still cause a repeated delivery; retries reuse the event ID, without an exactly-once guarantee. Run one process per database.
+SQLite stores snapshots, the waiting-reminder clock, and an outbox before transmission. The saved scores and accepted outbox establish task completion across restarts; completed tasks do not call OpenReview or send waiting reminders. Accepted events remain accepted across restarts. An ambiguous timeout can still cause a repeated delivery; retries reuse the event ID, without an exactly-once guarantee. Run one process per database.
 
 ## 8. Keep private data out of public repositories
 

@@ -50,74 +50,82 @@ class MonitorTests(unittest.TestCase):
             result = self.check([review()])
         self.assertTrue(result["data_changed"])
         self.assertEqual(result["notification_status"], "accepted")
+        self.assertEqual(result["action"], "completed")
         event = send.call_args.args[1]
         self.assertIn("6: Weak Accept", event["body"])
         self.assertIn("4: Confident", event["body"])
         self.assertEqual(event["url"], PAPER)
         self.assertNotIn("ttl", event)
 
-    def test_startup_with_scores_notifies_once_and_restart_keeps_baseline(self):
+    def test_startup_with_scores_completes_once_and_restart_does_not_query_api(self):
         with patch.object(monitor, "send_notification") as send:
-            self.assertEqual(self.check([review()])["notification_status"], "accepted")
+            first = self.check([review()])
+            self.assertEqual(first["notification_status"], "accepted")
+            self.assertEqual(first["action"], "completed")
             self.engine = monitor.Monitor(self.db_path)
-            self.assertEqual(self.check([review()])["notification_status"], "none")
+            with patch.object(monitor, "probe_openreview", side_effect=AssertionError("Completed tasks must not query OpenReview")) as probe:
+                restarted = self.engine.check_once(PAPER, "expired-token", KEY)
+            self.assertEqual(restarted["status"], "ok")
+            self.assertEqual(restarted["notification_status"], "none")
+            self.assertEqual(restarted["action"], "completed")
+            probe.assert_not_called()
         self.assertEqual(send.call_count, 1)
 
-    def test_new_review_rating_and_confidence_changes_are_separate_events(self):
+    def test_completed_task_does_not_resume_for_later_review_changes(self):
         with patch.object(monitor, "send_notification") as send:
             self.check([review()])
-            added = self.check([review(), review("R2", "8: Accept")])
-            self.assertTrue(added["data_changed"])
-            changed = self.check([review(rating="7: Accept"), review("R2", "8: Accept")])
-            self.assertTrue(changed["data_changed"])
-            confidence = self.check([review(rating="7: Accept", confidence="5: Very Confident"), review("R2", "8: Accept")])
-            self.assertTrue(confidence["data_changed"])
-        self.assertEqual(send.call_count, 4)
-        self.assertIn("新增", send.call_args_list[1].args[1]["title"])
-        self.assertIn("置信度", send.call_args_list[3].args[1]["title"])
-
-    def test_reordering_and_label_formatting_do_not_duplicate_score_alerts(self):
-        with patch.object(monitor, "send_notification") as send:
-            self.check([review(), review("R2", "8: Accept")])
-            result = self.check([review("R2", 8), review(rating=6, confidence=4)])
-        self.assertFalse(result["data_changed"])
+            for observed in (
+                [review(), review("R2", "8: Accept")],
+                [review(rating="7: Accept")],
+                [review(confidence="5: Very Confident")],
+            ):
+                with patch.object(monitor, "probe_openreview", return_value=observation(observed)) as probe:
+                    result = self.engine.check_once(PAPER, "", KEY)
+                self.assertFalse(result["data_changed"])
+                self.assertEqual(result["action"], "completed")
+                probe.assert_not_called()
         self.assertEqual(send.call_count, 1)
 
-    def test_empty_and_unscored_observations_do_not_reset_known_scores(self):
+    def test_unscored_reviews_do_not_complete_the_task(self):
         with patch.object(monitor, "send_notification") as send:
-            self.check([review()])
-            self.assertFalse(self.check([])["data_changed"])
-            self.assertFalse(self.check([review(rating=None)])["data_changed"])
-            self.assertFalse(self.check([review(confidence=None)])["data_changed"])
-            self.assertFalse(self.check([review()])["data_changed"])
-        self.assertEqual(send.call_count, 1)
+            for observed in ([], [review(rating=None)], [review(rating="not published")]):
+                result = self.check(observed)
+                self.assertEqual(result["status"], "ok")
+                self.assertNotEqual(result.get("action"), "completed")
+                self.assertFalse(result["data_changed"])
+        send.assert_not_called()
 
     def test_auth_or_access_failure_preserves_state_and_requires_attention(self):
         with patch.object(monitor, "send_notification") as send:
-            self.check([review()])
+            self.check([])
             for code, action in (("unauthorized", "needs_auth"), ("challenge_required", "access_verification")):
                 with patch.object(monitor, "probe_openreview", side_effect=core.ProbeError(code, "safe message")):
                     result = self.engine.check_once(PAPER, "private-token", KEY)
                 self.assertEqual(result["status"], "error")
                 self.assertEqual(result["action"], action)
                 self.assertNotIn("private-token", json.dumps(result))
-            self.assertFalse(self.check([review()])["data_changed"])
-        self.assertEqual(send.call_count, 1)
+            self.assertFalse(self.check([])["data_changed"])
+        send.assert_not_called()
 
     def test_push_failure_keeps_outbox_and_retry_reuses_event_id_after_restart(self):
         with patch.object(monitor, "send_notification", side_effect=core.ProbeError("network_error", "safe")) as failed:
             result = self.check([review()])
         self.assertEqual(result["notification_status"], "pending")
         self.assertEqual(result["pending_count"], 1)
+        self.assertEqual(result["action"], "retry_push")
         original_event = deepcopy(failed.call_args.args[1])
         self.engine = monitor.Monitor(self.db_path)
-        with patch.object(monitor, "send_notification") as retried:
-            result = self.check([review()])
+        with patch.object(monitor, "send_notification") as retried, patch.object(
+            monitor, "probe_openreview", side_effect=core.ProbeError("unauthorized", "expired session"),
+        ) as probe:
+            result = self.engine.check_once(PAPER, "expired-token", KEY)
             self.assertEqual(retried.call_args.args[1], original_event)
             self.assertFalse(result["data_changed"])
             self.assertEqual(result["notification_status"], "accepted")
             self.assertEqual(result["pending_count"], 0)
-            self.check([review()])
+            self.assertEqual(result["action"], "completed")
+            self.engine.check_once(PAPER, "expired-token", KEY)
+            probe.assert_not_called()
         self.assertEqual(retried.call_count, 1)
 
     def test_snapshot_and_pending_event_are_committed_before_transmission(self):
@@ -130,17 +138,86 @@ class MonitorTests(unittest.TestCase):
         with patch.object(monitor, "send_notification", side_effect=inspect_before_acceptance):
             self.check([review()])
 
-    def test_auth_failure_does_not_send_a_pending_event_or_clobber_it(self):
+    def test_pending_score_retry_still_fails_safely_without_querying_api(self):
         with patch.object(monitor, "send_notification", side_effect=core.ProbeError("network_error", "safe")):
             self.check([review()])
         with (
-            patch.object(monitor, "probe_openreview", side_effect=core.ProbeError("forbidden", "safe")),
-            patch.object(monitor, "send_notification") as send,
+            patch.object(monitor, "probe_openreview", side_effect=AssertionError("Already observed scores")) as probe,
+            patch.object(monitor, "send_notification", side_effect=core.ProbeError("bark_rejected", "safe")) as send,
         ):
-            self.engine.check_once(PAPER, "", KEY)
-        send.assert_not_called()
+            result = self.engine.check_once(PAPER, "", KEY)
+        send.assert_called_once()
+        probe.assert_not_called()
+        self.assertEqual(result["action"], "retry_push")
+        self.assertEqual(result["notification_status"], "pending")
         with closing(sqlite3.connect(self.db_path)) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox WHERE accepted_at IS NULL").fetchone()[0], 1)
+
+    def test_legacy_pending_scores_are_drained_in_order_before_completion(self):
+        timestamp = datetime.now(timezone.utc).isoformat()
+        events = [
+            {"id": "legacy-first", "title": "first score", "body": "R1:6", "url": PAPER},
+            {"id": "legacy-second", "title": "updated score", "body": "R1:7", "url": PAPER},
+        ]
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("INSERT INTO paper_state VALUES(?,?,?)", ("DemoPaper01", json.dumps({"R1": review()}), timestamp))
+            for event in events:
+                db.execute("INSERT INTO outbox VALUES(?,?,?,?,NULL)", (event["id"], "DemoPaper01", json.dumps(event), timestamp))
+        with patch.object(monitor, "probe_openreview", side_effect=AssertionError("Already observed scores")) as probe, patch.object(monitor, "send_notification") as send:
+            first = self.engine.check_once(PAPER, "", KEY)
+            self.assertEqual(first["pending_count"], 1)
+            self.assertNotEqual(first.get("action"), "completed")
+            second = self.engine.check_once(PAPER, "", KEY)
+            self.assertEqual(second["pending_count"], 0)
+            self.assertEqual(second["action"], "completed")
+            self.assertEqual([call.args[1] for call in send.call_args_list], events)
+            probe.assert_not_called()
+
+    def test_completion_and_pending_scores_are_isolated_by_forum(self):
+        with patch.object(monitor, "send_notification", side_effect=core.ProbeError("network_error", "safe")):
+            self.check([review()])
+        other_paper = "https://openreview.net/forum?id=DemoPaper02"
+        other = observation([])
+        other["forum_id"] = "DemoPaper02"
+        with patch.object(monitor, "probe_openreview", return_value=other) as probe, patch.object(monitor, "send_notification") as send:
+            result = self.engine.check_once(other_paper, "", KEY)
+            self.assertNotEqual(result.get("action"), "completed")
+            self.assertEqual(result["pending_count"], 0)
+            probe.assert_called_once_with(other_paper, "")
+            send.assert_not_called()
+        with patch.object(monitor, "send_notification"):
+            self.assertEqual(self.engine.check_once(PAPER, "", KEY)["action"], "completed")
+        with patch.object(monitor, "probe_openreview", return_value=other) as probe:
+            self.assertNotEqual(self.engine.check_once(other_paper, "", KEY).get("action"), "completed")
+            probe.assert_called_once()
+
+
+class ReviewMergeTests(unittest.TestCase):
+    def test_new_review_rating_and_confidence_changes_are_distinct(self):
+        initial = {"R1": review()}
+        merged, added, modified = monitor._merge_reviews(initial, [review(), review("R2", "8: Accept")])
+        self.assertEqual(added, ["R2"])
+        self.assertEqual(modified, [])
+        changed, added, modified = monitor._merge_reviews(merged, [review(rating="7: Accept")])
+        self.assertEqual(added, [])
+        self.assertEqual(modified, ["R1"])
+        _, added, modified = monitor._merge_reviews(changed, [review(rating="7: Accept", confidence="5: Very Confident")])
+        self.assertEqual(added, [])
+        self.assertEqual(modified, ["R1"])
+
+    def test_reordering_and_numeric_label_formatting_do_not_change_scores(self):
+        initial = {"R1": review(), "R2": review("R2", "8: Accept")}
+        _, added, modified = monitor._merge_reviews(initial, [review("R2", 8), review(rating=6, confidence=4)])
+        self.assertEqual(added, [])
+        self.assertEqual(modified, [])
+
+    def test_visibility_gaps_do_not_reset_known_scores(self):
+        initial = {"R1": review()}
+        for observed in ([], [review(rating=None)], [review(confidence=None)]):
+            merged, added, modified = monitor._merge_reviews(initial, observed)
+            self.assertEqual(merged, initial)
+            self.assertEqual(added, [])
+            self.assertEqual(modified, [])
 
 
 class WaitingReminderTests(unittest.TestCase):
@@ -237,21 +314,27 @@ class WaitingReminderTests(unittest.TestCase):
         self.check()
         self.assertNotEqual(self.send.call_args.args[1]["id"], first_event["id"])
 
-    def test_score_arrival_at_deadline_preempts_waiting_and_resets_timer(self):
+    def test_score_arrival_at_deadline_completes_and_permanently_stops_waiting(self):
         self.check()
         self.advance(3600)
         result = self.check([review()])
         self.assertEqual(result["notification_kind"], "update")
+        self.assertEqual(result["action"], "completed")
         self.assertEqual(self.send.call_count, 1)
         event = self.send.call_args.args[1]
         self.assertEqual(event["body"].splitlines()[0], "！！！！！！！！！！重要警报！！！！！！你的ICLR分数出来了，快来看咋样")
         self.assertIn("6: Weak Accept", event["body"])
-        self.advance(3599)
-        self.assertEqual(self.check([review()])["notification_status"], "none")
-        self.advance(1)
-        self.assertEqual(self.check([review()])["notification_kind"], "waiting")
+        for elapsed in (3599, 1, 86400):
+            self.advance(elapsed)
+            self.engine = monitor.Monitor(self.db_path)
+            with patch.object(monitor, "probe_openreview", side_effect=AssertionError("Completed tasks must not query OpenReview")) as probe:
+                result = self.engine.check_once(PAPER, "", KEY)
+            self.assertEqual(result["action"], "completed")
+            self.assertEqual(result["notification_status"], "none")
+            probe.assert_not_called()
+        self.assertEqual(self.send.call_count, 1)
 
-    def test_score_change_cancels_failed_waiting_event_and_confidence_resets_timer(self):
+    def test_score_arrival_cancels_failed_waiting_event_and_never_restarts_it(self):
         self.check()
         self.advance(3600)
         self.send.side_effect = core.ProbeError("network_error", "safe")
@@ -262,14 +345,14 @@ class WaitingReminderTests(unittest.TestCase):
         result = self.check([review()])
         self.assertEqual(result["notification_kind"], "update")
         self.assertEqual(result["pending_count"], 0)
+        self.assertEqual(result["action"], "completed")
         self.assertNotEqual(result["event_id"], waiting_id)
         self.advance(3599)
         confidence_change = [review(confidence="5: Very Confident")]
-        self.assertEqual(self.check(confidence_change)["notification_kind"], "update")
-        self.advance(3599)
+        self.assertEqual(self.check(confidence_change)["action"], "completed")
+        self.advance(3600)
         self.assertEqual(self.check(confidence_change)["notification_status"], "none")
-        self.advance(1)
-        self.assertEqual(self.check(confidence_change)["notification_kind"], "waiting")
+        self.assertEqual(self.send.call_count, 2)
         self.assertNotIn(waiting_id, [call.args[1]["id"] for call in self.send.call_args_list[1:]])
 
     def test_pending_score_alert_prevents_encouragement_from_accumulating(self):
@@ -280,9 +363,10 @@ class WaitingReminderTests(unittest.TestCase):
         result = self.check([review()])
         self.assertEqual(result["notification_kind"], "update")
         self.assertEqual(result["pending_count"], 1)
+        self.assertEqual(result["action"], "retry_push")
         self.assertEqual(self.send.call_args.args[1], score_event)
         with closing(sqlite3.connect(self.db_path)) as db:
-            self.assertIsNone(db.execute("SELECT pending_json FROM waiting_schedule").fetchone()[0])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM waiting_schedule WHERE pending_json IS NOT NULL").fetchone()[0], 0)
 
     def test_zero_interval_cancels_pending_waiting_and_never_disables_score_alerts(self):
         self.check()
@@ -302,16 +386,21 @@ class WaitingReminderTests(unittest.TestCase):
 
     def test_custom_interval_and_messages_preserve_score_details(self):
         options = {"waiting_interval_seconds": 10, "waiting_message": "自定义等待原文！", "update_message": "自定义警报原文！"}
-        self.check([review()], **options)
+        self.check(**options)
+        self.advance(9)
+        self.assertEqual(self.check(**options)["notification_status"], "none")
+        self.advance(1)
+        self.check(**options)
+        self.assertEqual(self.send.call_args.args[1]["body"], "自定义等待原文！")
+        result = self.check([review()], **options)
+        self.assertEqual(result["action"], "completed")
         event = self.send.call_args.args[1]
         self.assertTrue(event["body"].startswith("自定义警报原文！\nExample paper\n"))
         self.assertIn("置信度 4: Confident", event["body"])
         self.assertEqual(event["url"], PAPER)
-        self.advance(9)
+        self.advance(10)
         self.assertEqual(self.check([review()], **options)["notification_status"], "none")
-        self.advance(1)
-        self.check([review()], **options)
-        self.assertEqual(self.send.call_args.args[1]["body"], "自定义等待原文！")
+        self.assertEqual(self.send.call_count, 2)
 
     def test_each_paper_has_an_independent_persistent_waiting_timer(self):
         self.check()
@@ -337,17 +426,41 @@ class WaitingReminderTests(unittest.TestCase):
             db.execute("INSERT INTO paper_state VALUES(?,?,?)", ("DemoPaper01", json.dumps(original), self.time.isoformat()))
             db.execute("INSERT INTO outbox VALUES(?,?,?,?,NULL)", (pending["id"], "DemoPaper01", json.dumps(pending), self.time.isoformat()))
         self.engine = monitor.Monitor(self.db_path)
-        result = self.check([review()])
+        with patch.object(monitor, "probe_openreview", side_effect=AssertionError("Legacy scores must be reused")) as probe:
+            result = self.engine.check_once(PAPER, "expired-token", KEY)
+        probe.assert_not_called()
         self.assertFalse(result["data_changed"])
         self.assertEqual(self.send.call_args.args[1], pending)
         self.assertEqual(result["pending_count"], 0)
+        self.assertEqual(result["action"], "completed")
         with closing(sqlite3.connect(self.db_path)) as db:
             self.assertEqual(json.loads(db.execute("SELECT reviews_json FROM paper_state").fetchone()[0]), original)
             self.assertIsNotNone(db.execute("SELECT accepted_at FROM outbox").fetchone()[0])
-        self.advance(3599)
-        self.assertEqual(self.check([review()])["notification_status"], "none")
-        self.advance(1)
-        self.assertEqual(self.check([review()])["notification_kind"], "waiting")
+        self.advance(86400)
+        self.assertEqual(self.check([])["action"], "completed")
+        self.assertEqual(self.send.call_count, 1)
+
+    def test_upgrade_with_delivered_scores_discards_legacy_pending_waiting(self):
+        self.check([review()])
+        waiting = {"id": "legacy-waiting", "title": "ICLR：继续等待", "body": "stale reminder", "url": PAPER}
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute(
+                "INSERT OR REPLACE INTO waiting_schedule VALUES(?,?,?)",
+                ("DemoPaper01", self.time.isoformat(), json.dumps(waiting)),
+            )
+        self.send.reset_mock()
+        self.advance(86400)
+        self.engine = monitor.Monitor(self.db_path)
+        with patch.object(monitor, "probe_openreview", side_effect=core.ProbeError("unauthorized", "expired")) as probe:
+            result = self.engine.check_once(PAPER, "expired-token", KEY)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["action"], "completed")
+        self.assertEqual(result["pending_count"], 0)
+        self.assertEqual(result["notification_status"], "none")
+        probe.assert_not_called()
+        self.send.assert_not_called()
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM waiting_schedule WHERE pending_json IS NOT NULL").fetchone()[0], 0)
 
 
 class NotificationTransportTests(unittest.TestCase):

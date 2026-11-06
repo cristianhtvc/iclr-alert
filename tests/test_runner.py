@@ -85,6 +85,37 @@ class RunnerTests(unittest.TestCase):
         self.monitor_factory.assert_not_called()
         self.monitor.check_once.assert_not_called()
 
+    def test_completed_score_alert_stops_without_sleep_or_health_notification(self):
+        completed = result(action="completed")
+        completed.update(notification_status="accepted", notification_kind="update", pending_count=0)
+        self.monitor.check_once.side_effect = [completed]
+        sleep = Mock()
+        with patch.object(runner, "send_notification") as send, patch.object(runner, "_health_alert") as health, redirect_stdout(io.StringIO()):
+            returned = runner.run(watch=True, sleep=sleep)
+        self.assertEqual(returned["status"], "ok")
+        self.assertEqual(returned["action"], "completed")
+        self.monitor.check_once.assert_called_once()
+        sleep.assert_not_called()
+        health.assert_not_called()
+        send.assert_not_called()
+        saved = json.loads((self.data_dir / "monitor-status.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["action"], "completed")
+        self.assertNotIn("health_alert", saved)
+
+    def test_score_push_retries_until_accepted_then_stops(self):
+        pending = result("network_error", "retry_push")
+        pending.update(notification_status="pending", pending_count=1)
+        completed = result(action="completed")
+        completed.update(notification_status="accepted", pending_count=0)
+        self.monitor.check_once.side_effect = [pending, completed]
+        sleep = Mock()
+        with patch.object(runner, "send_notification") as send, redirect_stdout(io.StringIO()):
+            returned = runner.run(watch=True, sleep=sleep)
+        self.assertEqual(returned["action"], "completed")
+        self.assertEqual(self.monitor.check_once.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [call(120)])
+        send.assert_not_called()
+
     def test_recoverable_failure_backs_off_then_success_resets_delay(self):
         self.monitor.check_once.side_effect = [
             result("rate_limited", "retry", retry_after=300),
@@ -110,7 +141,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(second["health_alert"], "accepted")
         self.assertEqual(retried.call_args.args[1]["id"], first_id)
 
-    def test_push_failures_do_not_slow_score_polling(self):
+    def test_push_failures_keep_the_normal_retry_interval(self):
         self.monitor.check_once.side_effect = [
             result("network_error", "retry_push"),
             result("bark_rejected", "retry_push"),
